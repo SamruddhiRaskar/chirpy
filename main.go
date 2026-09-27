@@ -17,9 +17,19 @@ import (
 	_ "github.com/lib/pq"
 )
 
-type Chirp struct {
-	Body string `json:"body"`
+type createChirpRequest struct {
+	Body   string    `json:"body"`
+	UserID uuid.UUID `json:"user_id"`
 }
+
+type chirpResponse struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserID    uuid.UUID `json:"user_id"`
+}
+
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
@@ -47,6 +57,7 @@ func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 
 func (cfg *apiConfig) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	hits := cfg.fileserverHits.Load()
+
 	html := fmt.Sprintf(`
 	<html>
 	<body>
@@ -54,7 +65,7 @@ func (cfg *apiConfig) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	<p>Chirpy has been visited %d times!</p>
 	</body>
 	</html>
-		`, hits)
+	`, hits)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -67,6 +78,7 @@ func (cfg *apiConfig) resetHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Forbidden", http.StatusForbidden)
 		return
 	}
+
 	cfg.fileserverHits.Store(0)
 
 	err := cfg.db.DeleteAllUsers(r.Context())
@@ -87,50 +99,72 @@ func healthzHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-// validate_chirp handler
-func validateChirpHandler(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
+// create chirp handler
+func (cfg *apiConfig) createChirpHandler(w http.ResponseWriter, r *http.Request) {
+	var req createChirpRequest
 
-	var chirp Chirp
-	err := json.NewDecoder(r.Body).Decode(&chirp)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	if len(chirp.Body) > 140 {
-		http.Error(w, "Chirp  is too large", http.StatusBadRequest)
-	} else {
-		w.Header().Set("Content-Type", "application/json")
-		chirp.Body = strings.ReplaceAll(chirp.Body, "kerfuffle", "****")
-		chirp.Body = strings.ReplaceAll(chirp.Body, "fornax", "****")
-		chirp.Body = strings.ReplaceAll(chirp.Body, "sharbert", "****")
-
-		w.WriteHeader(http.StatusOK)
-
-		json.NewEncoder(w).Encode(map[string]any{
-			"cleaned_body": chirp.Body,
-			"valid":        true,
-		})
-	}
-}
-func (apiCfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) {
-
-	var req createUserRequest
 	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
-		// handle error
-		fmt.Println("error in decoding body :", err)
+		http.Error(w, "Something went wrong", http.StatusBadRequest)
 		return
 	}
-	fmt.Println("decoding passed :", req)
+
+	// Validate length
+	if len(req.Body) > 140 {
+		http.Error(w, "Chirp is too long", http.StatusBadRequest)
+		return
+	}
+
+	// Clean profanity
+	req.Body = strings.ReplaceAll(req.Body, "kerfuffle", "****")
+	req.Body = strings.ReplaceAll(req.Body, "fornax", "****")
+	req.Body = strings.ReplaceAll(req.Body, "sharbert", "****")
+
+	// Create database record
+	chirp, err := cfg.db.CreateChirp(r.Context(), database.CreateChirpParams{
+		Body:   req.Body,
+		UserID: req.UserID,
+	})
+	if err != nil {
+		fmt.Println("error creating chirp:", err)
+		http.Error(w, "Couldn't create chirp", http.StatusInternalServerError)
+		return
+	}
+
+	// Create API response
+	resp := chirpResponse{
+		ID:        chirp.ID,
+		CreatedAt: chirp.CreatedAt,
+		UpdatedAt: chirp.UpdatedAt,
+		Body:      chirp.Body,
+		UserID:    chirp.UserID,
+	}
+
+	// Return JSON
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+
+	json.NewEncoder(w).Encode(resp)
+}
+
+// create user handler
+func (apiCfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) {
+	var req createUserRequest
+
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		fmt.Println("error in decoding body:", err)
+		return
+	}
+
+	fmt.Println("decoding passed:", req)
 
 	user, err := apiCfg.db.CreateUser(r.Context(), req.Email)
 	if err != nil {
-		// handle error
 		fmt.Println("error in creating user in database:", err)
 		return
 	}
+
 	fmt.Println("created user in database:", user)
 
 	resp := userResponse{
@@ -151,6 +185,7 @@ func main() {
 	if err != nil {
 		log.Fatal("Error loading .env file", err)
 	}
+
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
 
@@ -177,7 +212,8 @@ func main() {
 	mux := http.NewServeMux()
 
 	fileserver := http.FileServer(http.Dir("."))
-	// here dir(.) says that look at the current directory means whats in folder
+	// http.Dir(".") means:
+	// look at the current directory and serve files from there.
 
 	appHandler := http.StripPrefix("/app", fileserver)
 
@@ -186,11 +222,11 @@ func main() {
 		apiCfg.middlewareMetricsInc(appHandler),
 	)
 
-	// Other routes
+	// Routes
 	mux.HandleFunc("GET /api/healthz", healthzHandler)
 	mux.HandleFunc("GET /admin/metrics", apiCfg.metricsHandler)
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetHandler)
-	mux.HandleFunc("POST /api/validate_chirp", validateChirpHandler)
+	mux.HandleFunc("POST /api/chirps", apiCfg.createChirpHandler)
 	mux.HandleFunc("POST /api/users", apiCfg.createUserHandler)
 
 	server := http.Server{
@@ -199,10 +235,8 @@ func main() {
 	}
 
 	fmt.Println("Listening on port 8080")
+
 	if err := server.ListenAndServe(); err != nil {
 		fmt.Println("Error starting server:", err)
 	}
-
-	//here it start the server
-
 }
