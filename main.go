@@ -153,13 +153,11 @@ func main() {
 	}
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
-	fmt.Println(dbURL)
 
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal("Error opening database:", err)
 	}
-	fmt.Println(db)
 
 	if err := db.Ping(); err != nil {
 		log.Fatal("Error connecting to database:", err)
